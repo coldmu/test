@@ -1,0 +1,40 @@
+- hosts: t2_nw
+  gather_facts: no
+  tasks:
+  - name: show processses status about Memory
+    ios_command:
+      commands: "show processes memory sorted allocated"
+    ignore_errors: yes
+    register: res_memory
+
+  - name: set res_test
+    set_fact:
+      res_test: "{{ res_memory.stdout_lines | flatten(1) }}"
+
+  - name: set Summary
+    set_fact:
+      header: ["{{'|{:^10}|{:^20}|{:^20}|{:^20}|{:^30}|'.format('PID','ALLOCATED(MB)','FREED(MB)','HOLDING(MB)','PROCESS') }}"]
+      result: "{{ res_test[4:14] }}"
+
+  - name: convert string to dictionary
+    set_fact:
+      tmp_mem_info: |
+        [
+        {%- for line in result -%}
+        {%- set data = line.split() -%}
+        "{{'|{:^10}|{:^20}|{:^20}|{:^20}|{:^30}|'.format(data[0],(data[2]|int/1024/1204)|round(1),(data[3]|int/1024/1024)|round(1),(data[4]|int/1024/1024)|round(1), data[7:]|join(' ')) }}",
+        {%- endfor -%}
+        ]
+
+  - name: convert string to dictionary
+    set_fact:
+      tmp_res: "{{ header + tmp_mem_info }}"
+
+  - name: convert string to dictionary
+    set_fact:
+      result: "{{ tmp_res | join('\n')  }}"
+
+  - name: output
+    copy:
+      content: "{{ result }}"
+      dest: "output.txt"
