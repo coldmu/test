@@ -1,0 +1,216 @@
+package contest;
+
+import java.awt.geom.Point2D;
+import java.awt.geom.Rectangle2D;
+
+import robocode.*;
+
+public class ChilaxBot extends AdvancedRobot {
+    // ====== 필드 및 상수 정의 ======
+    // ==== Arena & Bot Constants ====
+
+    private static final double GUN_WALL_PADDING = 17.5;
+    private static final int NAV_WALL_PADDING = 25;
+    private static final int AIM_RESOLUTION = 1000;
+    private static final int STATE_TABLE_SIZE = 126;
+    private static final int ENEMY_HASH_SIZE = 256;
+
+    //
+    private static double FIELD_WIDTH = 0;
+    private static double FIELD_HEIGHT = 0;
+
+
+    // Markov Prediction Table [opponent][state][table]
+    private static int[][][] transitionMatrix = new int[ENEMY_HASH_SIZE][579][STATE_TABLE_SIZE + 1];
+
+    // Enemy Info
+    private static String enemyId = null;
+    private static double enemyDistance = Double.POSITIVE_INFINITY;
+    private static double enemySpeed = 0;
+    private static double enemyHeading = 0;
+    private static int enemyMarkovState = 0;
+
+    // Bot Position/State
+    private static double selfX = 0;
+    private static double selfY = 0;
+    private static int travelDirection = 1;
+
+    public void run() {
+        FIELD_WIDTH = getBattleFieldWidth();
+        FIELD_HEIGHT = getBattleFieldHeight();
+
+        setAdjustGunForRobotTurn(true);
+        setTurnRadarRightRadians(enemyDistance = Double.POSITIVE_INFINITY);
+    }
+
+    public void onStatus(StatusEvent e) {
+        // === Corner navigation (inspired by MeleeSeed) ===
+        int navX = NAV_WALL_PADDING + 30 + (int)(enemyDistance / 2.5);
+        int navY = NAV_WALL_PADDING;
+
+        // Reverse direction if destination reached
+        if (getDistanceRemaining() == 0) {
+            travelDirection = -travelDirection;
+        }
+
+        // Set destination coordinates by direction
+        // travelDirection > 0: move to left/right wall
+        // travelDirection < 0: move to top/bottom wall
+        if (travelDirection > 0) {
+            navY = navX;
+            navX = NAV_WALL_PADDING;
+        }
+
+        // Move to opposite corner based on field center
+        selfX = getX();
+        selfY = getY();
+        if (selfX > FIELD_WIDTH / 2) {
+            navX = (int)FIELD_WIDTH - navX;
+        }
+        if (selfY > FIELD_HEIGHT / 2) {
+            navY = (int)FIELD_HEIGHT - navY;
+        }
+
+        // Calculate turn angle to destination
+        double turnAngle = absoluteBearing(navX, navY) - getHeadingRadians();
+
+        // Use tan(turnAngle) for fast direction change
+        setTurnRightRadians(Math.tan(turnAngle));
+
+        // Move forward with distance modulated by angle
+        setAhead(Math.cos(turnAngle) * Point2D.distance(selfX, selfY, navX, navY));
+    }
+
+    public void onScannedRobot(ScannedRobotEvent e) {
+        String scannedName = e.getName();
+        double enemySpeedNow = e.getVelocity();
+        double scannedDist = e.getDistance();
+        double scannedAbsBearing = getHeadingRadians() + e.getBearingRadians();
+
+        if (scannedDist < enemyDistance || scannedName.equals(enemyId)) {
+            enemyId = scannedName;
+            lockRadar(scannedAbsBearing);
+            double bulletPower = calculateBulletPower(getEnergy(), scannedDist);
+            fireIfReady(bulletPower, scannedDist);
+            int state = calculateMarkovState(enemySpeedNow, enemySpeed, enemyHeading, e.getHeadingRadians());
+            int bestBin = predictAndKernelDensity(state, scannedAbsBearing, scannedDist, enemySpeedNow, bulletPower);
+            aimGun(bestBin);
+            updateMarkovTable(state);
+            updateEnemyInfo(state, enemySpeedNow, e.getHeadingRadians());
+        }
+    }
+
+    // Radar lock to keep radar on enemy
+    private void lockRadar(double scannedAbsBearing) {
+        double radarTurn = robocode.util.Utils.normalRelativeAngle(scannedAbsBearing - getRadarHeadingRadians());
+        setTurnRadarRightRadians(Double.POSITIVE_INFINITY * radarTurn);
+    }
+
+    // Calculate bullet power based on energy and distance
+    private double calculateBulletPower(double energy, double distance) {
+        enemyDistance = distance;
+        return Math.log10(energy) * 325 / (Math.log10(distance) * 125);
+    }
+
+    // Fire if gun is ready
+    private void fireIfReady(double bulletPower, double scannedDist) {
+        if (bulletPower > 0 && getGunTurnRemaining() == 0) {
+            setFire(bulletPower);
+        }
+    }
+
+    // Calculate Markov state
+    private int calculateMarkovState(double enemySpeedNow, double prevSpeed, double prevHeading, double newHeading) {
+        int acceleration = (int)Math.signum(enemySpeedNow - prevSpeed) + 1;
+        int velocityBin = ((int)(8.5 + enemySpeedNow) << 2);
+        int headingDelta = (int)(-2 * robocode.util.Utils.normalRelativeAngle(prevHeading - (enemyHeading = newHeading)) /
+                                Rules.getTurnRateRadians(prevSpeed) + 2.5);
+        int result = acceleration + velocityBin + (headingDelta << 7);
+        // Clamp the result to valid state range [0, 578]
+        return Math.max(0, Math.min(result, 579 - 1));
+    }
+
+    // Markov prediction and kernel density, returns bestBin
+    private int predictAndKernelDensity(int state, double scannedAbsBearing, double scannedDist, double enemySpeedNow, double bulletPower) {
+        int enemyHash = Math.abs(enemyId.hashCode()) % ENEMY_HASH_SIZE;
+        int[][] table = transitionMatrix[enemyHash];
+        int[] aimBins = new int[AIM_RESOLUTION];
+        int bestBin = 0;
+        for (int i = 0; i <= 127; i++) {
+            double predictedX = selfX + Math.sin(scannedAbsBearing) * scannedDist;
+            double predictedY = selfY + Math.cos(scannedAbsBearing) * scannedDist;
+            int nextState = state;
+            int ticks = 1;
+            double heading = enemyHeading;
+            double velocity = enemySpeedNow;
+            int weight = 100;
+            do {
+                // Defensive check: clamp nextState to valid range before using as index
+                if (nextState < 0 || nextState >= table.length) {
+                    // Skip this prediction if out of bounds
+                    break;
+                }
+                int tableSize = Math.min(STATE_TABLE_SIZE, table[nextState][STATE_TABLE_SIZE]);
+                if (tableSize != 0) {
+                    nextState = table[nextState][(int)(Math.random() * tableSize)];
+                } else {
+                    weight = 5;
+                }
+                heading += ((nextState >> 7) - 2) * Rules.getTurnRateRadians(velocity) / 2;
+                velocity = ((nextState >> 2) & 31) - 8;
+                predictedX += Math.sin(heading) * velocity;
+                predictedY += Math.cos(heading) * velocity;
+                Rectangle2D.Double fieldRect = new Rectangle2D.Double(GUN_WALL_PADDING, GUN_WALL_PADDING,
+                        FIELD_WIDTH - (2 * GUN_WALL_PADDING), FIELD_HEIGHT - (2 * GUN_WALL_PADDING));
+                if (!fieldRect.contains(predictedX, predictedY)) {
+                    weight = 1;
+                }
+            } while (++ticks * Rules.getBulletSpeed(bulletPower) < Point2D.distance(selfX, selfY, predictedX, predictedY));
+
+            for (int offset = -4; offset <= 4; offset++) {
+                int bin = ((int)(AIM_RESOLUTION * absoluteBearing(predictedX, predictedY) / (2 * Math.PI)) + offset + AIM_RESOLUTION) % AIM_RESOLUTION;
+                aimBins[bin] += weight + 1 / (Math.abs(offset) + 1);
+                if (aimBins[bin] > aimBins[bestBin]) {
+                    bestBin = bin;
+                }
+            }
+        }
+        return bestBin;
+    }
+
+    // Gun aiming
+    private void aimGun(int bestBin) {
+        double gunTurn = robocode.util.Utils.normalRelativeAngle(2 * Math.PI * bestBin / AIM_RESOLUTION - getGunHeadingRadians());
+        setTurnGunRightRadians(gunTurn);
+    }
+
+    // Markov table update
+    private void updateMarkovTable(int state) {
+        int enemyHash = Math.abs(enemyId.hashCode()) % ENEMY_HASH_SIZE;
+        int[][] table = transitionMatrix[enemyHash];
+        if (getGunHeat() < 0.7) {
+            // Defensive check: clamp enemyMarkovState to valid range
+            if (enemyMarkovState < 0 || enemyMarkovState >= table.length) {
+                // Skip update if out of bounds
+                return;
+            }
+            int[] tableBin = table[enemyMarkovState];
+            tableBin[tableBin[STATE_TABLE_SIZE]++] = state;
+        }
+    }
+
+    // Update enemy info
+    private void updateEnemyInfo(int state, double enemySpeedNow, double newHeading) {
+        enemyMarkovState = state;
+        enemySpeed = enemySpeedNow;
+        enemyHeading = newHeading;
+    }
+
+    public void onRobotDeath(RobotDeathEvent e) {
+        setTurnRadarRightRadians(enemyDistance = Double.POSITIVE_INFINITY);
+    }
+
+    private static double absoluteBearing(double targetX, double targetY) {
+        return Math.atan2(targetX - selfX, targetY - selfY);
+    }
+}

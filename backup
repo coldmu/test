@@ -1,0 +1,227 @@
+package contest;
+
+import java.awt.geom.Point2D;
+import java.awt.geom.Rectangle2D;
+
+import robocode.*;
+
+public class ChilaxBot extends AdvancedRobot {
+    // ====== 필드 및 상수 정의 ======
+    private static final double FIELD_WIDTH = 1000.0; // 전장 가로
+    private static final double FIELD_HEIGHT = 1000.0; // 전장 세로
+    private static final double AIM_WALL_MARGIN = 17.5; // 총알 벽 여유
+    private static final int MOVE_WALL_MARGIN = 25; // 이동 벽 여유
+    private static final int FIRE_ANGLES = 1000; // 조준 각 분할 개수
+    private static final int TABLE_SIZE = 126; // 마르코프 테이블 크기
+    private static final int OPPONENT_HASHES = 256; // 적 해시 테이블 크기
+
+    // 마르코프 이동 예측 테이블 [적][상태][테이블]
+    private static int[][][] markovTransitionTable = new int[OPPONENT_HASHES][579][TABLE_SIZE + 1];
+
+    // 적 정보
+    private static String targetName = null; // 타겟 이름
+    private static double targetDistance = Double.POSITIVE_INFINITY; // 타겟 거리
+    private static double targetVelocity = 0; // 타겟 속도
+    private static double targetHeading = 0; // 타겟 각도
+    private static int targetMarkovState = 0; // 타겟 마르코프 상태
+
+    // 우리 위치/상태
+    private static double myX = 0;
+    private static double myY = 0;
+    private static int moveDir = 1; // 이동 방향 (1 또는 -1)
+
+    public void run() {
+        // 총구가 로봇 회전에 영향받지 않도록 설정
+        setAdjustGunForRobotTurn(true);
+        // 시작 시 타겟 초기화
+        targetDistance = Double.POSITIVE_INFINITY;
+        setTurnRadarRightRadians(targetDistance);
+    }
+
+    public void onStatus(StatusEvent e) {
+        // ==== 코너 이동: MeleeSeed에서 영감 ====
+        int targetX = MOVE_WALL_MARGIN + 30 + (int)(targetDistance / 2.5);
+        int targetY = MOVE_WALL_MARGIN;
+
+        // 목적지 도달 시 방향 반전
+        if (getDistanceRemaining() == 0) {
+            moveDir = -moveDir;
+        }
+
+        // 이동 방향에 따라 목적지 좌표 설정
+        // moveDir 1 이면 왼쪽 혹은 오른쪽 벽으로 이동.
+        // moveDir -1 이면 위쪽 혹은 아래쪽 벽으로 이동.
+        if (moveDir > 0) {
+            targetY = targetX;
+            targetX = MOVE_WALL_MARGIN;
+        }
+
+        // 전장 중앙 기준 반대편 코너로 이동
+        myX = getX();
+        myY = getY();
+        if (myX > FIELD_WIDTH / 2) {
+            targetX = (int)FIELD_WIDTH - targetX;
+        }
+        if (myY > FIELD_HEIGHT / 2) {
+            targetY = (int)FIELD_HEIGHT - targetY;
+        }
+
+        // 현재 내 위치(myX, myY)에서 목표 지점(targetX, targetY)까지의 절대 각도를 구한 뒤,
+        // 내 현재 바라보는 방향(getHeadingRadians())을 빼서, 목표 지점까지 회전해야 할 각도를 계산한다.
+        // turnAngle이 양수면 시계방향, 음수면 반시계방향으로 회전해야 목표를 바라보게 됨.
+        double turnAngle = absoluteBearing(targetX, targetY) - getHeadingRadians();
+
+        // Math.tan(turnAngle)을 사용하여, 회전해야 할 각도의 탄젠트 값을 구해 setTurnRightRadians에 전달한다.
+        // 일반적으로 setTurnRightRadians(turnAngle)로 바로 회전하지만,
+        // 이 코드는 탄젠트 값을 사용하여, 각도가 90도에 가까워질수록 회전량이 급격히 커지는 특성을 활용해
+        // 벽이나 특정 경로에서 더욱 빠르게 방향을 바꾸는 효과를 낸다.
+        setTurnRightRadians(Math.tan(turnAngle));
+
+        // 목표 지점까지의 직선 거리를 구한 뒤, 그 거리에 Math.cos(turnAngle)를 곱해 이동 거리를 결정한다.
+        // 만약 turnAngle이 0(즉, 목표를 정확히 바라보는 경우)라면, 최대한 많이 이동하고,
+        // 각도가 크면 이동량이 줄어든다. 이는 회전하면서 동시에 앞으로 나아가도록 만들어,
+        // 자연스럽고 유연한 코너 이동을 구현한다.
+        setAhead(Math.cos(turnAngle) * Point2D.distance(myX, myY, targetX, targetY));
+    }
+
+    public void onScannedRobot(ScannedRobotEvent e) {
+        // ==== 적 스캔 시 처리 ====
+        String scannedName = e.getName(); // 스캔한 적의 이름
+        int opponentId = scannedName.hashCode() & (OPPONENT_HASHES - 1); // 적 이름 해시로 식별자 생성
+        double opponentVelocity = e.getVelocity(); // 적의 속도
+        double scannedDistance = e.getDistance(); // 적과의 거리
+        double scannedAbsoluteBearing = getHeadingRadians() + e.getBearingRadians(); // 적의 절대 각도 계산
+
+        // 타겟 선정: 더 가까운 적이거나, 기존 타겟이면 갱신
+        if (scannedDistance < targetDistance || scannedName.equals(targetName)) {
+            targetName = scannedName; // 타겟 이름 저장
+
+            // 레이더 락: 적 방향으로 무한 회전하여 놓치지 않게 함
+            // if (getGunHeat() < 1) {
+                double radarTurn = robocode.util.Utils.normalRelativeAngle(scannedAbsoluteBearing - getRadarHeadingRadians()); // 레이더가 적을 향하도록 각도 계산
+                setTurnRadarRightRadians(Double.POSITIVE_INFINITY * radarTurn); // 무한 회전으로 락
+            // }
+
+            // 발사 파워 계산: 에너지와 거리로 적절한 파워 산출
+            // bulletPower 계산 공식 설명:
+            // 1. getEnergy()는 내 로봇의 현재 에너지를 반환한다.
+            // 2. Math.log10(getEnergy())는 내 에너지의 로그값(밑 10)을 구한다.
+            //    - 에너지가 높을수록 로그값도 커진다.
+            // 3. 이 값을 325와 곱해준다. (공격성 계수, 실험적으로 정해진 값)
+            // 4. 이 값을 적과의 거리로 나눠준다. (가까울수록 파워가 커짐)
+            // 5. (targetDistance = scannedDistance)는 targetDistance를 최신값으로 갱신하면서 계산에 사용한다.
+            //    (즉, scannedDistance를 targetDistance에 대입하고, 그 값을 분모로 사용)
+            // 6. 결과적으로, 내 에너지가 높고 적이 가까울수록 더 강한 총알을 발사한다.
+            //    반대로, 에너지가 낮거나 적이 멀면 파워가 낮아진다.
+            //
+            // 예시 1: 내 에너지가 80, 적과의 거리가 400일 때
+            //   Math.log10(80) ≈ 1.903
+            //   1.903 * 325 ≈ 618.5
+            //   618.5 / 400 ≈ 1.546
+            //   → bulletPower = 약 1.55
+            //
+            // 예시 2: 내 에너지가 40, 적과의 거리가 200일 때
+            //   Math.log10(40) ≈ 1.602
+            //   1.602 * 325 ≈ 520.65
+            //   520.65 / 200 ≈ 2.603
+            //   → bulletPower = 약 2.60
+            //
+            // 예시 3: 내 에너지가 10, 적과의 거리가 600일 때
+            //   Math.log10(10) = 1
+            //   1 * 325 = 325
+            //   325 / 600 ≈ 0.542
+            //   → bulletPower = 약 0.54
+            double bulletPower = Math.log10(getEnergy()) * 325 / (Math.log10((targetDistance = scannedDistance))*95);
+            // 총구가 목표를 정확히 겨냥하고 있고 파워가 0보다 크면 발사
+            if (bulletPower > 0 && getGunTurnRemaining() == 0) {
+                setFire(bulletPower);
+            }
+
+            // ===== 마르코프 상태 계산 =====
+            // (1) 가속도: 이전 프레임 대비 적 속도 변화
+            int acceleration = (int)Math.signum(opponentVelocity - targetVelocity) + 1;
+            // (2) 속도: 적 속도를 0~16 구간으로 양자화
+            int velocityBin = ((int)(8.5 + opponentVelocity) << 2);
+            // (3) 방향 변화: 적의 헤딩 변화량을 구간화
+            int headingDelta = (int)(-2 * robocode.util.Utils.normalRelativeAngle(targetHeading - (targetHeading = e.getHeadingRadians())) /
+                                    Rules.getTurnRateRadians(targetVelocity) + 2.5);
+            // (4) 세 값으로 마르코프 상태 인코딩
+            int state = acceleration + velocityBin + (headingDelta << 7);
+
+            // ===== 마르코프 이동 예측 및 커널 밀도 =====
+            int[][] table = markovTransitionTable[opponentId]; // 적별 마르코프 테이블
+            int[] aimBins = new int[FIRE_ANGLES]; // 각도별 누적 가중치 저장 배열
+            int bestBin = 0; // 가장 확률이 높은 각도 인덱스
+            // 여러 번 예측 시뮬레이션(샘플링) 반복
+            for (int i = 0; i <= 127; i++) {
+                // (1) 현재 적 위치에서 시작
+                double predictedX = myX + Math.sin(scannedAbsoluteBearing) * scannedDistance;
+                double predictedY = myY + Math.cos(scannedAbsoluteBearing) * scannedDistance;
+                int nextState = state; // 예측용 상태
+                int ticks = 1; // 총알이 도달하는 데 걸리는 틱 수
+                double heading = targetHeading; // 예측용 헤딩
+                double velocity = opponentVelocity; // 예측용 속도
+                int weight = 100; // 예측 경로의 신뢰도(가중치)
+                // 총알이 적에게 도달할 때까지 적의 이동을 예측
+                do {
+                    // (2) 마르코프 테이블에서 다음 상태 샘플링(랜덤)
+                    int tableSize = Math.min(TABLE_SIZE, table[nextState][TABLE_SIZE]);
+                    if (tableSize != 0) {
+                        nextState = table[nextState][(int)(Math.random() * tableSize)];
+                    } else {
+                        weight = 5; // 데이터 부족 시 가중치 축소
+                    }
+                    // (3) 상태값을 이용해 적의 헤딩, 속도, 위치 예측
+                    heading += ((nextState >> 7) - 2) * Rules.getTurnRateRadians(velocity) / 2; // 방향 변화
+                    velocity = ((nextState >> 2) & 31) - 8; // 속도 변화
+                    predictedX += Math.sin(heading) * velocity; // X좌표 이동
+                    predictedY += Math.cos(heading) * velocity; // Y좌표 이동
+                    // (4) 벽에 부딪히면 가중치 크게 감소
+                    Rectangle2D.Double fieldRect = new Rectangle2D.Double(AIM_WALL_MARGIN, AIM_WALL_MARGIN,
+                            FIELD_WIDTH - (2 * AIM_WALL_MARGIN), FIELD_HEIGHT - (2 * AIM_WALL_MARGIN));
+                    if (!fieldRect.contains(predictedX, predictedY)) {
+                        weight = 1;
+                    }
+                } while (++ticks * Rules.getBulletSpeed(bulletPower) < Point2D.distance(myX, myY, predictedX, predictedY));
+
+                // (5) 예측 위치를 바탕으로 커널 밀도 갱신 및 최적 각도 탐색
+                for (int offset = -4; offset <= 4; offset++) {
+                    // 예측 위치에서 내 위치로의 각도를 FIRE_ANGLES로 분할하여 인덱스 계산
+                    int bin = ((int)(FIRE_ANGLES * absoluteBearing(predictedX, predictedY) / (2 * Math.PI)) + offset + FIRE_ANGLES) % FIRE_ANGLES;
+                    // 해당 각도에 가중치 누적(커널 밀도)
+                    aimBins[bin] += weight + 1 / (Math.abs(offset) + 1);
+                    // 가장 누적값이 큰 각도를 bestBin으로 선정
+                    if (aimBins[bin] > aimBins[bestBin]) {
+                        bestBin = bin;
+                    }
+                }
+            }
+
+            // ===== 총구 조준 =====
+            // bestBin(가장 확률 높은 각도)로 총구를 회전
+            double gunTurn = robocode.util.Utils.normalRelativeAngle(2 * Math.PI * bestBin / FIRE_ANGLES - getGunHeadingRadians());
+            setTurnGunRightRadians(gunTurn);
+
+            // ===== 마르코프 테이블 갱신 =====
+            // 이전 상태에서 현재 상태로의 전이를 테이블에 기록하여 학습
+            if (getGunHeat() < 0.7) {
+                int[] tableBin = table[targetMarkovState];
+                tableBin[tableBin[TABLE_SIZE]++] = state;
+            }
+
+            // ===== 적 정보 갱신 =====
+            targetMarkovState = state; // 현재 상태 저장(다음 예측에 사용)
+            targetVelocity = opponentVelocity; // 속도 갱신
+        }
+    }
+
+    public void onRobotDeath(RobotDeathEvent e) {
+        // 적이 죽으면 타겟 거리 초기화 및 레이더를 무한 회전시켜 새로운 적 탐색
+        targetDistance = Double.POSITIVE_INFINITY;
+        setTurnRadarRightRadians(targetDistance);
+    }
+
+    private static double absoluteBearing(double targetX, double targetY) {
+        return Math.atan2(targetX - myX, targetY - myY);
+    }
+}

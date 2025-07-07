@@ -1,0 +1,504 @@
+package contest;
+
+
+import robocode.*;
+import java.awt.geom.Point2D;
+import java.awt.geom.Rectangle2D;
+import java.util.*;
+
+
+/**
+ * WaveSurfer - Wave Surfing 전략을 사용하는 Robocode 봇 (수정 버전)
+ */
+public class Mubot_wavesurfing extends AdvancedRobot {
+
+
+    // 적 정보 저장
+    private Enemy enemy = new Enemy();
+
+
+    // Wave 정보 저장
+    private ArrayList<Wave> waves = new ArrayList<Wave>();
+
+
+    // 위험도 배열 (GuessFactor 기반)
+    private static int[] surfStats = new int[31]; // -15 to +15 guess factors
+
+
+    // 레이더 방향
+    private double radarDirection = 1;
+
+
+    // 이동 관련 변수
+    private double moveDirection = 1;
+    private long lastMoveTime = 0;
+
+
+    public void run() {
+        setAdjustGunForRobotTurn(true);
+        setAdjustRadarForGunTurn(true);
+        setAdjustRadarForRobotTurn(true);
+
+
+        // 초기 이동 설정
+        setAhead(Double.POSITIVE_INFINITY);
+        setTurnRightRadians(Double.POSITIVE_INFINITY);
+
+
+        do {
+            // 기본 이동 (적이 없을 때)
+            if (getTime() - lastMoveTime > 10) {
+                basicMovement();
+            }
+
+
+            // 레이더를 계속 회전시켜 적을 탐지
+            turnRadarRightRadians(radarDirection * Double.POSITIVE_INFINITY);
+
+
+            execute(); // 중요: 명령 실행
+        } while (true);
+    }
+
+
+    private void basicMovement() {
+        // 벽과의 거리 체크
+        double distanceToWall = Math.min(
+                Math.min(getX(), getBattleFieldWidth() - getX()),
+                Math.min(getY(), getBattleFieldHeight() - getY())
+        );
+
+
+        if (distanceToWall < 100) {
+            // 벽에 가까우면 중앙으로 이동
+            double centerX = getBattleFieldWidth() / 2;
+            double centerY = getBattleFieldHeight() / 2;
+            double angleToCenter = Math.atan2(centerX - getX(), centerY - getY());
+
+
+            setTurnRightRadians(normalizeRelativeAngle(angleToCenter - getHeadingRadians()));
+            setAhead(100);
+        } else {
+            // 무작위 이동
+            if (Math.random() < 0.1) {
+                moveDirection *= -1;
+                setTurnRightRadians(moveDirection * (Math.random() * Math.PI/2));
+            }
+            setAhead(moveDirection * 100);
+        }
+
+
+        lastMoveTime = getTime();
+    }
+
+
+    public void onScannedRobot(ScannedRobotEvent e) {
+        // 적 정보 업데이트
+        enemy.update(e, this);
+        lastMoveTime = getTime();
+
+
+        // Wave 생성 (적이 발사했을 것으로 추정되는 경우)
+        if (enemy.energy > 0 && enemy.energy > e.getEnergy() &&
+                enemy.energy - e.getEnergy() <= 3.0 && enemy.energy - e.getEnergy() >= 0.1) {
+            double bulletPower = enemy.energy - e.getEnergy();
+            Wave wave = new Wave();
+            wave.sourceX = enemy.x;
+            wave.sourceY = enemy.y;
+            wave.startBearing = enemy.bearing;
+            wave.startTime = getTime() - 1;
+            wave.bulletVelocity = 20 - 3 * bulletPower;
+            waves.add(wave);
+        }
+
+
+        // 지나간 Wave 제거
+        updateWaves();
+
+
+        // Wave가 있으면 Wave Surfing, 없으면 기본 이동
+        if (!waves.isEmpty()) {
+            doSurfing();
+        } else {
+            doBasicEvasion(e);
+        }
+
+
+        // 타겟팅으로 공격
+        doTargeting();
+
+
+        // 레이더 조정
+        updateRadar(e);
+
+
+        execute(); // 명령 실행
+    }
+
+
+    private void doBasicEvasion(ScannedRobotEvent e) {
+        // 간단한 회피 이동
+        double enemyBearing = getHeadingRadians() + e.getBearingRadians();
+
+
+        // 적과 수직으로 이동
+        double moveAngle = enemyBearing + Math.PI/2 * moveDirection;
+
+
+        // 벽 충돌 체크
+        if (willHitWall(moveAngle, 100)) {
+            moveDirection *= -1;
+            moveAngle = enemyBearing + Math.PI/2 * moveDirection;
+        }
+
+
+        // 이동
+        double turnAngle = normalizeRelativeAngle(moveAngle - getHeadingRadians());
+        setTurnRightRadians(turnAngle);
+        setAhead(100);
+
+
+        // 주기적으로 방향 변경
+        if (Math.random() < 0.05) {
+            moveDirection *= -1;
+        }
+    }
+
+
+    private boolean willHitWall(double angle, double distance) {
+        double x = getX() + Math.sin(angle) * distance;
+        double y = getY() + Math.cos(angle) * distance;
+
+
+        int margin = 60;
+
+
+        return (x < margin || x > getBattleFieldWidth() - margin ||
+                y < margin || y > getBattleFieldHeight() - margin);
+    }
+
+
+    private void updateWaves() {
+        for (int i = waves.size() - 1; i >= 0; i--) {
+            Wave wave = waves.get(i);
+            if (wave.hasPassedMe(getX(), getY(), getTime())) {
+                waves.remove(i);
+            }
+        }
+    }
+
+
+    private void doSurfing() {
+        Wave surfWave = getClosestWave();
+        if (surfWave == null) return;
+
+
+        double dangerLeft = checkDanger(surfWave, -1);
+        double dangerRight = checkDanger(surfWave, 1);
+
+
+        double goAngle = absoluteBearing(surfWave.sourceX, surfWave.sourceY, getX(), getY());
+
+
+        if (dangerLeft < dangerRight) {
+            goAngle = goAngle - Math.PI/2;
+        } else {
+            goAngle = goAngle + Math.PI/2;
+        }
+
+
+        // 벽 스무딩 적용
+        goAngle = wallSmoothing(getX(), getY(), goAngle, dangerLeft < dangerRight ? -1 : 1);
+
+
+        // 이동 실행
+        setBackAsFront(this, goAngle);
+    }
+
+
+    private double checkDanger(Wave wave, int direction) {
+        Point2D.Double predictedPos = predictPosition(wave, direction);
+        if (predictedPos != null) {
+            int index = getFactorIndex(wave, predictedPos);
+            if (index >= 0 && index < surfStats.length) {
+                return surfStats[index];
+            }
+        }
+        return 0;
+    }
+
+
+    private Point2D.Double predictPosition(Wave wave, int direction) {
+        Point2D.Double predictedPosition = new Point2D.Double(getX(), getY());
+        double predictedVelocity = getVelocity();
+        double predictedHeading = getHeadingRadians();
+
+
+        int counter = 0;
+        boolean intercepted = false;
+
+
+        do {
+            double moveAngle = absoluteBearing(wave.sourceX, wave.sourceY,
+                    predictedPosition.x, predictedPosition.y) + (direction * (Math.PI/2));
+
+
+            moveAngle = normalizeRelativeAngle(moveAngle - predictedHeading);
+
+
+            double moveDir = 1;
+            if (Math.cos(moveAngle) < 0) {
+                moveAngle += Math.PI;
+                moveDir = -1;
+            }
+
+
+            moveAngle = normalizeRelativeAngle(moveAngle);
+
+
+            double maxTurning = Math.PI/720d * (40d - 3d * Math.abs(predictedVelocity));
+            predictedHeading = normalizeRelativeAngle(predictedHeading +
+                    limit(-maxTurning, moveAngle, maxTurning));
+
+
+            predictedVelocity += (predictedVelocity * moveDir < 0 ? 2*moveDir : moveDir);
+            predictedVelocity = limit(-8, predictedVelocity, 8);
+
+
+            predictedPosition.x += Math.sin(predictedHeading) * predictedVelocity;
+            predictedPosition.y += Math.cos(predictedHeading) * predictedVelocity;
+
+
+            counter++;
+
+
+            if (wave.hasPassedPosition(predictedPosition.x, predictedPosition.y,
+                    (long) (wave.startTime + counter))) {
+                intercepted = true;
+            }
+        } while (!intercepted && counter < 50); // 반복 횟수 줄임
+
+
+        return predictedPosition;
+    }
+
+
+    private double wallSmoothing(double botX, double botY, double angle, int orientation) {
+        int iterations = 0;
+        while (!fieldRectangle(36).contains(projectMotion(botX, botY, angle, 120)) && iterations < 20) {
+            angle += orientation * 0.1;
+            
+iterations++;
+}
+return angle;
+}
+
+
+private Point2D.Double projectMotion(double x, double y, double angle, double distance) {
+return new Point2D.Double(x + Math.sin(angle) * distance, y + Math.cos(angle) * distance);
+}
+
+
+private Rectangle2D.Double fieldRectangle(double margin) {
+return new Rectangle2D.Double(margin, margin,
+        getBattleFieldWidth() - margin * 2, getBattleFieldHeight() - margin * 2);
+}
+
+
+private Wave getClosestWave() {
+double closestDistance = Double.POSITIVE_INFINITY;
+Wave closestWave = null;
+
+
+for (Wave wave : waves) {
+    double distance = Point2D.distance(wave.sourceX, wave.sourceY, getX(), getY()) -
+            wave.distanceTraveled(getTime());
+    if (distance > 0 && distance < closestDistance) {
+        closestDistance = distance;
+        closestWave = wave;
+    }
+}
+return closestWave;
+}
+
+
+private void doTargeting() {
+if (enemy.distance == 0) return; // 적 정보가 없으면 리턴
+
+
+double bearingFromGun = normalizeRelativeAngle(enemy.bearing - getGunHeadingRadians());
+
+
+// 간단한 선형 예측
+double bulletPower = Math.min(3.0, getEnergy());
+double bulletSpeed = 20 - 3 * bulletPower;
+double timeToTarget = enemy.distance / bulletSpeed;
+
+
+double predictedBearing = bearingFromGun + (enemy.lateralVelocity / enemy.distance) * timeToTarget;
+
+
+setTurnGunRightRadians(predictedBearing);
+
+
+if (Math.abs(getGunTurnRemainingRadians()) < 0.1) {
+    setFire(bulletPower);
+}
+}
+
+
+private void updateRadar(ScannedRobotEvent e) {
+double radarTurn = normalizeRelativeAngle(enemy.bearing - getRadarHeadingRadians());
+double extraTurn = Math.min(Math.atan(36.0 / e.getDistance()), Rules.RADAR_TURN_RATE_RADIANS);
+
+
+radarTurn += (radarTurn < 0 ? -extraTurn : extraTurn);
+setTurnRadarRightRadians(radarTurn);
+}
+
+
+public void onHitByBullet(HitByBulletEvent e) {
+// 기본 회피 행동
+moveDirection *= -1;
+setTurnRightRadians(moveDirection * Math.PI/4);
+setAhead(100);
+
+
+// Wave 찾아서 위험도 증가
+Wave hitWave = findHitWave();
+if (hitWave != null) {
+    int index = getFactorIndex(hitWave, new Point2D.Double(getX(), getY()));
+    if (index >= 0 && index < surfStats.length) {
+        surfStats[index] += 10;
+    }
+}
+}
+
+
+public void onHitWall(HitWallEvent e) {
+// 벽에 부딪혔을 때 방향 바꾸기
+moveDirection *= -1;
+setBack(50);
+setTurnRightRadians(moveDirection * Math.PI/2);
+}
+
+
+private Wave findHitWave() {
+for (Wave wave : waves) {
+    if (Math.abs(wave.startTime - (getTime() -
+            Point2D.distance(wave.sourceX, wave.sourceY, getX(), getY()) / wave.bulletVelocity)) < 3) {
+        return wave;
+    }
+}
+return null;
+}
+
+
+private int getFactorIndex(Wave wave, Point2D.Double targetLocation) {
+double offsetAngle = normalizeRelativeAngle(
+        absoluteBearing(wave.sourceX, wave.sourceY, targetLocation.x, targetLocation.y) - wave.startBearing);
+double maxAngle = maxEscapeAngle(wave.bulletVelocity);
+
+
+if (maxAngle == 0) return 15; // 중앙값 반환
+
+
+double factor = offsetAngle / maxAngle;
+return (int)limit(0, (factor * 15) + 15, 30);
+}
+
+
+private double maxEscapeAngle(double velocity) {
+return Math.asin(Math.min(1.0, 8.0 / velocity));
+}
+
+
+private double getDirection() {
+return enemy.lateralVelocity >= 0 ? 1 : -1;
+}
+
+
+// 유틸리티 메서드들
+private double absoluteBearing(double x1, double y1, double x2, double y2) {
+return Math.atan2(x2 - x1, y2 - y1);
+}
+
+
+private double limit(double min, double value, double max) {
+return Math.max(min, Math.min(value, max));
+}
+
+
+private double normalizeRelativeAngle(double angle) {
+while (angle > Math.PI) {
+    angle -= 2.0 * Math.PI;
+}
+while (angle < -Math.PI) {
+    angle += 2.0 * Math.PI;
+}
+return angle;
+}
+
+
+private void setBackAsFront(AdvancedRobot robot, double goAngle) {
+double angle = normalizeRelativeAngle(goAngle - robot.getHeadingRadians());
+
+
+if (Math.abs(angle) > (Math.PI/2)) {
+    if (angle < 0) {
+        robot.setTurnRightRadians(Math.PI + angle);
+    } else {
+        robot.setTurnLeftRadians(Math.PI - angle);
+    }
+    robot.setBack(100);
+} else {
+    if (angle < 0) {
+        robot.setTurnLeftRadians(-angle);
+    } else {
+        robot.setTurnRightRadians(angle);
+    }
+    robot.setAhead(100);
+}
+}
+}
+
+
+// 적 정보를 저장하는 클래스
+class Enemy {
+double x, y, bearing, distance, energy = 100, lateralVelocity;
+
+
+void update(ScannedRobotEvent e, AdvancedRobot robot) {
+energy = e.getEnergy();
+bearing = e.getBearingRadians() + robot.getHeadingRadians();
+distance = e.getDistance();
+
+
+x = robot.getX() + Math.sin(bearing) * distance;
+y = robot.getY() + Math.cos(bearing) * distance;
+
+
+lateralVelocity = e.getVelocity() * Math.sin(e.getHeadingRadians() - bearing);
+}
+}
+
+
+// Wave 클래스
+class Wave {
+double sourceX, sourceY, startBearing, startTime, bulletVelocity;
+
+
+double distanceTraveled(long currentTime) {
+return (currentTime - startTime) * bulletVelocity;
+}
+
+
+boolean hasPassedMe(double myX, double myY, long currentTime) {
+return Point2D.distance(sourceX, sourceY, myX, myY) <= distanceTraveled(currentTime) + 18;
+}
+
+
+boolean hasPassedPosition(double x, double y, long time) {
+return Point2D.distance(sourceX, sourceY, x, y) <= distanceTraveled(time);
+}
+}
