@@ -6,30 +6,34 @@ import java.awt.geom.Rectangle2D;
 import java.util.*;
 
 /**
- * WaveSurfer - Wave Surfing 전략을 사용하는 Robocode 봇 (한글 주석 및 리팩토링 버전)
- * 
- * - 적의 파동(Wave)을 추적하며, 위험도를 예측하여 회피하는 전략 사용
- * - Markov 예측, GuessFactor, 벽 스무딩, 중력장 이동 등 여러 기법 적용
+ * Wavesurfing - Wave Surfing 전략 기반 Robocode 봇
+ *
+ * <리팩토링 및 한글 주석 강화 버전>
+ *
+ * - 적의 파동(Wave) 추적 및 위험 예측, 회피 전략 적용
+ * - Markov Chain 기반 적 이동 예측, GuessFactor, 벽 스무딩, 중력장 이동 등 다양한 기법 사용
  */
 public class Wavesurfing extends AdvancedRobot {
-    // === 주요 변수 선언 ===
-    private Enemy enemy = new Enemy(); // 적 정보 저장 클래스
+    // =====================
+    // === 주요 변수 및 상수 ===
+    // =====================
+    private Enemy enemy = new Enemy(); // 적 정보 저장용 객체
     private ArrayList<Wave> waves = new ArrayList<>(); // 적이 쏜 파동(총알) 정보 저장
     private static int[] surfStats = new int[31]; // GuessFactor 기반 위험도 통계 [-15~+15]
-    private static final double MAX_SURF_DISTANCE = 400; // Wave Surfing 시작 거리(px)
+    private static final double MAX_SURF_DISTANCE = 400; // Wave Surfing 발동 거리(px)
 
     // 이동/레이더 관련 변수
     private double moveDirection = 1; // 이동 방향 (1: 정방향, -1: 역방향)
 
-    // 필드/상수
+    // 필드 및 상수
     private static final double GUN_WALL_PADDING = 17.5; // 총알 피격시 벽 여유
     private static final int NAV_WALL_PADDING = 25;      // 내비게이션 벽 여유
     private static final int AIM_RESOLUTION = 1000;      // 타겟팅 분할 해상도
     private static final int STATE_TABLE_SIZE = 126;     // Markov 테이블 크기
     private static final int ENEMY_HASH_SIZE = 256;      // 적 구분 해시 크기
 
-    private static double FIELD_WIDTH = 0;  // 전장 가로
-    private static double FIELD_HEIGHT = 0; // 전장 세로
+    private static double fieldWidth = 0;  // 전장 가로
+    private static double fieldHeight = 0; // 전장 세로
 
     // Markov 예측 테이블 [적][상태][테이블]
     private static int[][][] transitionMatrix = new int[ENEMY_HASH_SIZE][579][STATE_TABLE_SIZE + 1];
@@ -46,27 +50,30 @@ public class Wavesurfing extends AdvancedRobot {
     private static double selfY = 0;
     private static int travelDirection = 1;              // 내 이동 방향
 
-    private static boolean meleeMode = true; // 근접전/난전 모드 플래그
+    private static boolean meleeMode = true; // 근접전/난전 모드 여부
 
+    // =======================
+    // === 메인 루프 및 초기화 ===
+    // =======================
     /**
-     * 봇의 메인 루프. 초기화 및 레이더/총 세팅.
+     * 봇의 메인 루프 - 초기화 및 레이더/총 설정
      */
     public void run() {
-        setAdjustGunForRobotTurn(true);
-        setAdjustRadarForGunTurn(true);
-        setAdjustRadarForRobotTurn(true);
+        setAdjustGunForRobotTurn(true); // 몸체 회전 시 총 방향 고정
+        setAdjustRadarForGunTurn(true); // 총 회전 시 레이더 고정
+        setAdjustRadarForRobotTurn(true); // 몸체 회전 시 레이더 고정
 
-
-        FIELD_WIDTH = getBattleFieldWidth();
-        FIELD_HEIGHT = getBattleFieldHeight();
-        turnRadarRightRadians(Double.POSITIVE_INFINITY);
-        setTurnRadarRightRadians(enemyDistance = Double.POSITIVE_INFINITY);
+        fieldWidth = getBattleFieldWidth();
+        fieldHeight = getBattleFieldHeight();
+        turnRadarRightRadians(Double.POSITIVE_INFINITY); // 무한 레이더 회전
+        setTurnRadarRightRadians(enemyDistance = Double.POSITIVE_INFINITY); // 레이더 초기화
         execute();
-
-
     }
 
 
+    // ================================
+    // === 적 스캔 및 주요 이벤트 처리 ===
+    // ================================
     /**
      * 적을 스캔했을 때 호출되는 이벤트 핸들러
      * - 적 발포 감지 및 Wave 생성
@@ -74,10 +81,11 @@ public class Wavesurfing extends AdvancedRobot {
      */
     public void onScannedRobot(ScannedRobotEvent e) {
         // 남은 적 수에 따라 근접전/난전 모드 결정
-        meleeMode = getOthers() >= 3;
+        meleeMode = getOthers() >= 3; // 3명 이상 남으면 난전 모드
         System.out.println("meleeMode: " + meleeMode);
 
         // 적이 발사한 것으로 추정될 때 Wave(총알) 정보 생성
+        // 적이 총을 쏜 것으로 추정되면 Wave(총알) 정보 생성
         if (enemy.energy > 0 && enemy.energy > e.getEnergy() &&
                 enemy.energy - e.getEnergy() <= 3.0 && enemy.energy - e.getEnergy() >= 0.1) {
             double bulletPower = enemy.energy - e.getEnergy();
@@ -96,10 +104,10 @@ public class Wavesurfing extends AdvancedRobot {
         updateWaves();
 
         // Wave가 가까우면 Wave Surfing(회피), 아니면 기본 이동
-        Wave surfWaveTemp = getClosestWave();
-        if (surfWaveTemp != null) {
-            double distanceToWave = Point2D.distance(surfWaveTemp.sourceX, surfWaveTemp.sourceY, getX(), getY())
-                    - surfWaveTemp.distanceTraveled(getTime());
+        Wave closestWave = getClosestWave();
+        if (closestWave != null) {
+            double distanceToWave = Point2D.distance(closestWave.sourceX, closestWave.sourceY, getX(), getY())
+                    - closestWave.distanceTraveled(getTime());
             if (distanceToWave <= MAX_SURF_DISTANCE && !meleeMode) {
                 System.out.println("doSurfing");
                 doSurfing();
@@ -174,6 +182,12 @@ public class Wavesurfing extends AdvancedRobot {
         setBackAsFront(this, goAngle);
     }
 
+    // =============================
+    // === 위험도 예측 및 보조 메서드 ===
+    // =============================
+    /**
+     * 해당 방향으로 이동 시 위험도를 계산 (GuessFactor 기반)
+     */
     private double checkDanger(Wave wave, int direction) {
         Point2D.Double predictedPos = predictPosition(wave, direction);
         if (predictedPos != null) {
@@ -185,6 +199,9 @@ public class Wavesurfing extends AdvancedRobot {
         return 0;
     }
 
+    /**
+     * 해당 방향으로 이동을 예측하여 최종 위치 반환
+     */
     private Point2D.Double predictPosition(Wave wave, int direction) {
         Point2D.Double predictedPosition = new Point2D.Double(getX(), getY());
         double predictedVelocity = getVelocity();
@@ -223,30 +240,23 @@ public class Wavesurfing extends AdvancedRobot {
                     (long) (wave.startTime + counter))) {
                 intercepted = true;
             }
-        } while (!intercepted && counter < 50); // 반복 횟수 줄임
+        } while (!intercepted && counter < 50); // 최대 50틱 예측
 
         return predictedPosition;
     }
 
     /**
-     * Smooth the desired movement angle so that the projected location stays
-     * within a safe margin from the battlefield walls.  Compared to the previous
-     * implementation this version :
-     *  1. Uses a tighter safety margin (18px – half robot width) so the robot
-     *     can squeeze closer without collisions.
-     *  2. Employs a smaller adjustment step (0.05 rad) for a smoother curve.
-     *  3. Allows a few more iterations (30) but exits early once the path is
-     *     clear.
+     * 벽 스무딩: 이동 각도를 조정하여 벽에 너무 가까이 가지 않도록 보정
      */
     private double wallSmoothing(double botX, double botY, double angle, int orientation) {
         double smoothedAngle = angle;
-        final double wallStick = 120;      // distance to project when testing
+        final double wallStick = 120;      // 테스트용 투사 거리
         final int maxIterations = 30;
         int tries = 0;
 
         while (!fieldRectangle(18).contains(projectMotion(botX, botY, smoothedAngle, wallStick))
                 && tries < maxIterations) {
-            smoothedAngle += orientation * 0.05; // finer adjustment
+            smoothedAngle += orientation * 0.05; // 미세 조정
             tries++;
         }
         return smoothedAngle;
@@ -261,6 +271,9 @@ public class Wavesurfing extends AdvancedRobot {
                 getBattleFieldWidth() - margin * 2, getBattleFieldHeight() - margin * 2);
     }
 
+    /**
+     * 내 위치에서 가장 가까운 Wave(총알) 반환
+     */
     private Wave getClosestWave() {
         double closestDistance = Double.POSITIVE_INFINITY;
         Wave closestWave = null;
@@ -276,9 +289,14 @@ public class Wavesurfing extends AdvancedRobot {
         return closestWave;
     }
 
+    // =====================
+    // === 이벤트 핸들러 ===
+    // =====================
+    /**
+     * 총알에 맞았을 때 호출되는 이벤트 - 회피 및 위험 통계 갱신
+     */
     public void onHitByBullet(HitByBulletEvent e) {
-        // 기본 회피 행동
-        moveDirection *= -1;
+        moveDirection *= -1; // 이동 방향 반전
         setTurnRightRadians(moveDirection * Math.PI / 4);
         setAhead(100);
 
@@ -292,13 +310,18 @@ public class Wavesurfing extends AdvancedRobot {
         }
     }
 
+    /**
+     * 벽에 부딪혔을 때 호출되는 이벤트 - 이동 방향 반전
+     */
     public void onHitWall(HitWallEvent e) {
-        // 벽에 부딪혔을 때 방향 바꾸기
         moveDirection *= -1;
         setBack(50);
         setTurnRightRadians(moveDirection * Math.PI / 2);
     }
 
+    /**
+     * 내 위치에서 맞은 Wave(총알)를 찾음
+     */
     private Wave findHitWave() {
         for (Wave wave : waves) {
             if (Math.abs(wave.startTime - (getTime() -
@@ -309,6 +332,9 @@ public class Wavesurfing extends AdvancedRobot {
         return null;
     }
 
+    /**
+     * GuessFactor 인덱스 계산 (위험도 통계용)
+     */
     private int getFactorIndex(Wave wave, Point2D.Double targetLocation) {
         double offsetAngle = normalizeRelativeAngle(
                 absoluteBearing(wave.sourceX, wave.sourceY, targetLocation.x, targetLocation.y) - wave.startBearing);
@@ -321,12 +347,16 @@ public class Wavesurfing extends AdvancedRobot {
         return (int) limit(0, (factor * 15) + 15, 30);
     }
 
+    /**
+     * 최대 회피 각도 계산
+     */
     private double maxEscapeAngle(double velocity) {
         return Math.asin(Math.min(1.0, 8.0 / velocity));
     }
 
-
-    // 유틸리티 메서드들
+    // ======================
+    // === 유틸리티 메서드 ===
+    // ======================
     private double absoluteBearing(double x1, double y1, double x2, double y2) {
         return Math.atan2(x2 - x1, y2 - y1);
     }
@@ -336,23 +366,19 @@ public class Wavesurfing extends AdvancedRobot {
     }
 
     private double normalizeRelativeAngle(double angle) {
-        while (angle > Math.PI) {
-            angle -= 2.0 * Math.PI;
-        }
-        while (angle < -Math.PI) {
-            angle += 2.0 * Math.PI;
-        }
+        while (angle > Math.PI) angle -= 2.0 * Math.PI;
+        while (angle < -Math.PI) angle += 2.0 * Math.PI;
         return angle;
     }
 
     /**
-     * Compute a repulsive force-based angle from walls to maintain distance.
+     * 벽과의 거리 유지를 위한 중력장 각도 계산
      */
     private double calcGravityAngle() {
         double x = getX(), y = getY();
         double w = getBattleFieldWidth(), h = getBattleFieldHeight();
-        final double forceConst = 5000; // repulsion strength
-        // Wall repulsion on X and Y
+        final double forceConst = 5000; // 벽 반발력 상수
+        // X, Y축 벽 반발력 계산
         double fx = forceConst/(x*x) - forceConst/((w - x)*(w - x));
         double fy = forceConst/(y*y) - forceConst/((h - y)*(h - y));
         return Math.atan2(fx, fy);
@@ -380,77 +406,85 @@ public class Wavesurfing extends AdvancedRobot {
         }
     }
 
+    /**
+     * 상태 이벤트(매 틱마다 호출) - 근접전 코너 내비게이션 (MeleeSeed 참고)
+     */
     public void onStatus(StatusEvent e) {
-        // === Corner navigation (inspired by MeleeSeed) ===
         int navX = NAV_WALL_PADDING + 30 + (int)(enemyDistance / 2.5);
         int navY = NAV_WALL_PADDING;
 
-        // Reverse direction if destination reached
+        // 목적지 도달 시 방향 반전
         if (getDistanceRemaining() == 0) {
             travelDirection = -travelDirection;
         }
 
-        // Set destination coordinates by direction
-        // travelDirection > 0: move to left/right wall
-        // travelDirection < 0: move to top/bottom wall
+        // 이동 방향에 따라 목적지 좌표 설정
         if (travelDirection > 0) {
             navY = navX;
             navX = NAV_WALL_PADDING;
         }
 
-        // Move to opposite corner based on field center
+        // 필드 중심 기준 반대편 코너로 이동
         selfX = getX();
         selfY = getY();
-        if (selfX > FIELD_WIDTH / 2) {
-            navX = (int)FIELD_WIDTH - navX;
+        if (selfX > fieldWidth / 2) {
+            navX = (int)fieldWidth - navX;
         }
-        if (selfY > FIELD_HEIGHT / 2) {
-            navY = (int)FIELD_HEIGHT - navY;
+        if (selfY > fieldHeight / 2) {
+            navY = (int)fieldHeight - navY;
         }
 
-        // Calculate turn angle to destination
+        // 목적지까지의 회전 각도 계산
         double turnAngle = absoluteBearing(navX, navY) - getHeadingRadians();
 
-        // Use tan(turnAngle) for fast direction change
+        // 빠른 방향 전환을 위해 tan 사용
         setTurnRightRadians(Math.tan(turnAngle));
 
-        // Move forward with distance modulated by angle
+        // 각도에 따라 전진 거리 조절
         setAhead(Math.cos(turnAngle) * Point2D.distance(selfX, selfY, navX, navY));
     }
 
-
-
-    // Radar lock to keep radar on enemy
+    /**
+     * 레이더를 적에게 고정
+     */
     private void lockRadar(double scannedAbsBearing) {
         double radarTurn = robocode.util.Utils.normalRelativeAngle(scannedAbsBearing - getRadarHeadingRadians());
         setTurnRadarRightRadians(Double.POSITIVE_INFINITY * radarTurn);
     }
 
-    // Calculate bullet power based on energy and distance
+    /**
+     * 에너지와 거리 기반 총알 파워 계산
+     */
     private double calculateBulletPower(double energy, double distance) {
         enemyDistance = distance;
         return Math.log10(energy) * 325 / (Math.log10(distance) * 97);
     }
 
-    // Fire if gun is ready
+    /**
+     * 총이 준비되었을 때만 발사
+     */
     private void fireIfReady(double bulletPower, double scannedDist) {
         if (bulletPower > 0 && getGunTurnRemaining() == 0) {
             setFire(bulletPower);
         }
     }
 
-    // Calculate Markov state
+    /**
+     * Markov 상태 계산
+     */
     private int calculateMarkovState(double enemySpeedNow, double prevSpeed, double prevHeading, double newHeading) {
         int acceleration = (int)Math.signum(enemySpeedNow - prevSpeed) + 1;
         int velocityBin = ((int)(8.5 + enemySpeedNow) << 2);
         int headingDelta = (int)(-2 * robocode.util.Utils.normalRelativeAngle(prevHeading - (enemyHeading = newHeading)) /
                                 Rules.getTurnRateRadians(prevSpeed) + 2.5);
         int result = acceleration + velocityBin + (headingDelta << 7);
-        // Clamp the result to valid state range [0, 578]
+        // 유효 범위 [0, 578]로 클램프
         return Math.max(0, Math.min(result, 579 - 1));
     }
 
-    // Markov prediction and kernel density, returns bestBin
+    /**
+     * Markov 기반 예측 및 커널 밀도 계산 (최적 타겟팅 bin 반환)
+     */
     private int predictAndKernelDensity(int state, double scannedAbsBearing, double scannedDist, double enemySpeedNow, double bulletPower) {
         int enemyHash = Math.abs(enemyId.hashCode()) % ENEMY_HASH_SIZE;
         int[][] table = transitionMatrix[enemyHash];
@@ -465,9 +499,8 @@ public class Wavesurfing extends AdvancedRobot {
             double velocity = enemySpeedNow;
             int weight = 100;
             do {
-                // Defensive check: clamp nextState to valid range before using as index
+                // 방어적 체크: nextState 유효성
                 if (nextState < 0 || nextState >= table.length) {
-                    // Skip this prediction if out of bounds
                     break;
                 }
                 int tableSize = Math.min(STATE_TABLE_SIZE, table[nextState][STATE_TABLE_SIZE]);
@@ -481,7 +514,7 @@ public class Wavesurfing extends AdvancedRobot {
                 predictedX += Math.sin(heading) * velocity;
                 predictedY += Math.cos(heading) * velocity;
                 Rectangle2D.Double fieldRect = new Rectangle2D.Double(GUN_WALL_PADDING, GUN_WALL_PADDING,
-                        FIELD_WIDTH - (2 * GUN_WALL_PADDING), FIELD_HEIGHT - (2 * GUN_WALL_PADDING));
+                        fieldWidth - (2 * GUN_WALL_PADDING), fieldHeight - (2 * GUN_WALL_PADDING));
                 if (!fieldRect.contains(predictedX, predictedY)) {
                     weight = 1;
                 }
@@ -498,49 +531,61 @@ public class Wavesurfing extends AdvancedRobot {
         return bestBin;
     }
 
-    // Gun aiming
+    /**
+     * 총 조준 (bestBin에 맞춰 총 회전)
+     */
     private void aimGun(int bestBin) {
         double gunTurn = robocode.util.Utils.normalRelativeAngle(2 * Math.PI * bestBin / AIM_RESOLUTION - getGunHeadingRadians());
         setTurnGunRightRadians(gunTurn);
     }
 
-    // Markov table update
+    /**
+     * Markov 테이블 갱신
+     */
     private void updateMarkovTable(int state) {
         int enemyHash = Math.abs(enemyId.hashCode()) % ENEMY_HASH_SIZE;
         int[][] table = transitionMatrix[enemyHash];
         if (getGunHeat() < 0.7) {
-            // Defensive check: clamp enemyMarkovState to valid range
             if (enemyMarkovState < 0 || enemyMarkovState >= table.length) {
-                // Skip update if out of bounds
                 return;
             }
             int[] tableBin = table[enemyMarkovState];
             int idx = tableBin[STATE_TABLE_SIZE];
             if (idx >= STATE_TABLE_SIZE) {
-                idx = 0; // Reset index if full (overwrite oldest)
+                idx = 0; // 가득 차면 처음부터 덮어씀
             }
             tableBin[idx] = state;
             tableBin[STATE_TABLE_SIZE] = idx + 1;
         }
     }
-
+    
+    /**
+     * 적 상태 정보 갱신
+     */
     private void updateEnemyInfo(int state, double enemySpeedNow, double newHeading) {
         enemyMarkovState = state;
         enemySpeed = enemySpeedNow;
         enemyHeading = newHeading;
     }
 
+    /**
+     * 적 사망 시 레이더 초기화
+     */
     public void onRobotDeath(RobotDeathEvent e) {
         setTurnRadarRightRadians(enemyDistance = Double.POSITIVE_INFINITY);
     }
 
+    /**
+     * 절대 각도 계산 (필드 기준)
+     */
     private static double absoluteBearing(double targetX, double targetY) {
         return Math.atan2(targetX - selfX, targetY - selfY);
     }
-
 }
 
-// === 적 정보를 저장하는 클래스 ===
+// ========================
+// === 적 정보 저장 클래스 ===
+// ========================
 class Enemy {
     double x, y;               // 적 좌표
     double bearing;            // 내 기준 적의 각도(라디안)
@@ -563,7 +608,9 @@ class Enemy {
     }
 }
 
-// === Wave(적 총알) 정보 클래스 ===
+// =================
+// === Wave 클래스 ===
+// =================
 class Wave {
     double sourceX, sourceY;      // 총알 발사 위치
     double startBearing;          // 발사 각도
